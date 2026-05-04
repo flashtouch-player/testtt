@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Mi APK · ExoPlayer Demo</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0b0b10;color:#fff;margin:0;padding:24px}
+  h1{margin:0 0 12px}
+  button{background:#3b82f6;color:#fff;border:0;padding:14px 22px;border-radius:10px;font-size:16px;margin:6px 0;width:100%}
+  input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#1a1a22;color:#fff;margin:6px 0}
+  .hint{opacity:.6;font-size:13px;margin-top:24px;line-height:1.5}
+</style>
+</head>
+<body>
+  <h1>🎬 Reproductor nativo</h1>
+  <p>Reemplaza este archivo por tu <code>index.html</code>.</p>
+
+  <input id="url" value="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" />
+  <button id="btnPlay">▶ Reproducir con ExoPlayer (nativo)</button>
+  <button id="btnStop">■ Detener</button>
+
+  <p class="hint">
+    El plugin nativo Media3/ExoPlayer soporta HLS, DASH, DRM Widevine,
+    subtítulos, PiP y reproducción en background — sin las limitaciones
+    del <code>&lt;video&gt;</code> de la WebView.
+  </p>
+
+  <script type="module">
+    import { ExoPlayer } from './exoplayer-bridge.js';
+    document.getElementById('btnPlay').onclick = () => {
+      ExoPlayer.play({
+        url: document.getElementById('url').value,
+        title: 'Demo',
+        type: 'hls'
+      });
+    };
+    document.getElementById('btnStop').onclick = () => ExoPlayer.stop();
+  </script>
+</body>
+</html>

@@ -1,0 +1,267 @@
+name: Build APK
+
+# ── Configura aquí tu app ────────────────────────────────────────────────────
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  APP_NAME:     "MiApp Player"      # Nombre visible en el teléfono
+  APP_ID:       "com.miapp.player"  # Package ID (no cambiar después de publicar)
+  VERSION_NAME: "1.0.0"             # Versión legible
+  VERSION_CODE: "1"                 # Entero incremental
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Versión (ej: 1.2.0)"
+        required: false
+        default: ""
+      version_code:
+        description: "Código de versión (entero)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Versión dinámica (override manual o valor del env)
+      - name: Resolve version
+        id: ver
+        run: |
+          VN="${{ github.event.inputs.version_name }}"
+          VC="${{ github.event.inputs.version_code }}"
+          [ -z "$VN" ] && VN="${{ env.VERSION_NAME }}"
+          [ -z "$VC" ] && VC="${{ env.VERSION_CODE }}"
+          echo "name=$VN" >> $GITHUB_OUTPUT
+          echo "code=$VC" >> $GITHUB_OUTPUT
+
+      - name: Install npm deps
+        run: npm install
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      # Nombre de app y versión
+      - name: Patch app name & version
+        run: |
+          set -e
+          STRINGS="android/app/src/main/res/values/strings.xml"
+          if [ -f "$STRINGS" ]; then
+            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${{ env.APP_NAME }}</string>|" "$STRINGS"
+          fi
+          GRADLE="android/app/build.gradle"
+          sed -i "s/versionCode [0-9]*/versionCode ${{ steps.ver.outputs.code }}/" "$GRADLE"
+          sed -i "s/versionName \"[^\"]*\"/versionName \"${{ steps.ver.outputs.name }}\"/" "$GRADLE"
+          echo "App: ${{ env.APP_NAME }} | v${{ steps.ver.outputs.name }} (${{ steps.ver.outputs.code }})"
+
+      # Icono launcher
+      - name: Install imagemagick
+        run: sudo apt-get install -y imagemagick
+
+      - name: Generate launcher icons
+        run: |
+          set -e
+          SRC="icon.png"
+          if [ ! -f "$SRC" ]; then
+            echo "No icon.png — generando placeholder..."
+            convert -size 1024x1024 xc:"#1a1a2e" \
+              -fill "#e94560" -font DejaVu-Sans-Bold -pointsize 300 \
+              -gravity Center -annotate 0 "M" \
+              placeholder_icon.png
+            SRC="placeholder_icon.png"
+          fi
+          BASE="android/app/src/main/res"
+          declare -A SIZES=(["mipmap-mdpi"]=48 ["mipmap-hdpi"]=72 ["mipmap-xhdpi"]=96 ["mipmap-xxhdpi"]=144 ["mipmap-xxxhdpi"]=192)
+          for DIR in "${!SIZES[@]}"; do
+            SIZE="${SIZES[$DIR]}"
+            mkdir -p "$BASE/$DIR"
+            convert "$SRC" -resize "${SIZE}x${SIZE}" "$BASE/$DIR/ic_launcher.png"
+            convert "$SRC" -resize "${SIZE}x${SIZE}" "$BASE/$DIR/ic_launcher_round.png"
+            echo "  ✓ $DIR -> ${SIZE}px"
+          done
+
+      # Integrar ExoPlayer
+      - name: Integrate ExoPlayer plugin module
+        run: |
+          set -e
+          cp -r android-plugin/exoplayer android/
+          cat >> android/settings.gradle <<'EOF'
+
+          include ':exoplayer'
+          project(':exoplayer').projectDir = new File('./exoplayer')
+          EOF
+          sed -i "0,/dependencies\s*{/{s//dependencies {\n    implementation project(':exoplayer')/}" android/app/build.gradle
+          MAIN_JAVA=$(find android/app/src/main/java -name 'MainActivity.java' | head -n1 || true)
+          MAIN_KT=$(find android/app/src/main/java -name 'MainActivity.kt' | head -n1 || true)
+          if [ -n "$MAIN_JAVA" ]; then
+            python3 - "$MAIN_JAVA" <<'PY'
+          import sys, re
+          p = sys.argv[1]
+          s = open(p).read()
+          if 'ExoPlayerPlugin.class' not in s:
+            if 'import com.miapp.exoplayer.ExoPlayerPlugin;' not in s:
+              s = re.sub(r'(package [^\n;]+;\s*)', r'\1\nimport com.miapp.exoplayer.ExoPlayerPlugin;\n', s, count=1)
+            if 'super.onCreate' in s:
+              s = s.replace('super.onCreate(savedInstanceState);',
+                            'registerPlugin(ExoPlayerPlugin.class);\n        super.onCreate(savedInstanceState);', 1)
+            else:
+              s = re.sub(r'(public class MainActivity[^\{]*\{)',
+                         r'\1\n  @Override\n  public void onCreate(android.os.Bundle s){ registerPlugin(ExoPlayerPlugin.class); super.onCreate(s); }\n',
+                         s, count=1)
+            open(p,'w').write(s)
+          PY
+          elif [ -n "$MAIN_KT" ]; then
+            python3 - "$MAIN_KT" <<'PY'
+          import sys, re
+          p = sys.argv[1]
+          s = open(p).read()
+          if 'ExoPlayerPlugin::class' not in s:
+            if 'import com.miapp.exoplayer.ExoPlayerPlugin' not in s:
+              s = re.sub(r'(package [^\n]+\n)', r'\1\nimport com.miapp.exoplayer.ExoPlayerPlugin\n', s, count=1)
+            if 'super.onCreate' in s:
+              s = s.replace('super.onCreate(savedInstanceState)',
+                            'registerPlugin(ExoPlayerPlugin::class.java)\n        super.onCreate(savedInstanceState)', 1)
+            open(p,'w').write(s)
+          PY
+          fi
+
+      # Permisos PiP en el Manifest principal
+      - name: Patch main AndroidManifest for PiP
+        run: |
+          set -e
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "SYSTEM_ALERT_WINDOW" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n    <application|' "$MANIFEST"
+          fi
+          python3 - "$MANIFEST" <<'PY'
+          import sys, re
+          p = sys.argv[1]
+          s = open(p).read()
+          m = re.search(r'<activity[^>]*MainActivity[^>]*/?>',s, re.DOTALL)
+          if m:
+              block = m.group(0)
+              if 'supportsPictureInPicture' not in s:
+                  s = s.replace(block, block.replace('android:exported=',
+                      'android:supportsPictureInPicture="true"\n            android:resizeableActivity="true"\n            android:exported='), 1)
+          open(p,'w').write(s)
+          PY
+          echo "✓ Manifest PiP parcheado"
+
+      - name: Capacitor sync
+        run: npx cap sync android
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      # Keystore para firma
+      # Secrets necesarios (Settings → Secrets → Actions):
+      #   KEYSTORE_BASE64   → base64 del .keystore  (cat release.keystore | base64)
+      #   KEYSTORE_PASSWORD → contraseña del keystore
+      #   KEY_ALIAS         → alias (ej: miapp)
+      #   KEY_PASSWORD      → contraseña de la llave
+      - name: Setup keystore (desde secrets)
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "✓ Keystore cargado desde secrets"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-generate keystore (si no hay secrets)
+        if: steps.keystore.outputs.available != 'true'
+        run: |
+          keytool -genkeypair -v \
+            -keystore android/app/release.keystore \
+            -alias miapp \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android123 -keypass android123 \
+            -dname "CN=MiApp, OU=Dev, O=MiOrg, L=SPS, S=Cortes, C=HN"
+          echo "⚠️  Keystore autogenerado. Descárgalo y guárdalo para builds futuras."
+
+      # Inyectar firma en build.gradle
+      - name: Inject signing config
+        run: |
+          set -e
+          GRADLE="android/app/build.gradle"
+          KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
+          KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+          KEY_PASS="${{ secrets.KEY_PASSWORD }}"
+          [ -z "$KS_PASS" ]   && KS_PASS="android123"
+          [ -z "$KEY_ALIAS" ] && KEY_ALIAS="miapp"
+          [ -z "$KEY_PASS" ]  && KEY_PASS="android123"
+          python3 - "$GRADLE" "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS" <<'PY'
+          import sys, re
+          gradle, ks_pass, key_alias, key_pass = sys.argv[1:]
+          s = open(gradle).read()
+          signing_block = f"""
+              signingConfigs {{
+                  release {{
+                      storeFile file("release.keystore")
+                      storePassword "{ks_pass}"
+                      keyAlias "{key_alias}"
+                      keyPassword "{key_pass}"
+                  }}
+              }}
+          """
+          if 'signingConfigs' not in s:
+              s = re.sub(r'(\s*buildTypes\s*\{)', signing_block + r'\1', s, count=1)
+          if 'signingConfig signingConfigs.release' not in s:
+              s = re.sub(r'(release\s*\{)',
+                         r'\1\n            signingConfig signingConfigs.release', s, count=1)
+          open(gradle, 'w').write(s)
+          print("✓ Signing config inyectado")
+          PY
+
+      # Build Release APK
+      - name: Build Release APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Rename APK with version
+        run: |
+          SRC="android/app/build/outputs/apk/release/app-release.apk"
+          DEST="android/app/build/outputs/apk/release/MiApp-v${{ steps.ver.outputs.name }}.apk"
+          mv "$SRC" "$DEST"
+          echo "✓ APK: MiApp-v${{ steps.ver.outputs.name }}.apk"
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiApp-v${{ steps.ver.outputs.name }}-signed
+          path: android/app/build/outputs/apk/release/MiApp-v${{ steps.ver.outputs.name }}.apk
+          if-no-files-found: error
+
+      # Solo sube el keystore si fue autogenerado (para que lo guardes)
+      - name: Upload generated keystore (¡GUÁRDALO!)
+        if: steps.keystore.outputs.available != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-keystore-GUARDAR-ESTE-ARCHIVO
+          path: android/app/release.keystore
